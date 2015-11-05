@@ -1,0 +1,150 @@
+#!/bin/bash
+
+# generate_hdfs_data
+# author: Jonny Daenen
+# Date Created: 2014-11-13
+#
+# Creates n rows, using m mappers and a python data generation function.
+#
+# hdfs_tmpdir will be created and removed after use!
+
+if [ $# -ne 8 ]
+then
+    echo "	Usage: generate_hdfs_data.sh num_rows num_chunks {function.py|builtin} funcname hdfs_tmpdir hdfs_outdir tabremoval{0|1} {hadoop|local}"
+	exit 1
+fi
+
+
+#STREAMJAR=/usr/lib/hadoop-mapreduce/hadoop-streaming.jar
+# TODO auto-detect streaming jar
+#STREAMJAR=$HADOOP_HOME/share/hadoop/tools/lib/hadoop-streaming-2.5.2.jar
+STREAMJAR=$HADOOP_STREAM_JAR
+
+# store script location
+SCRIPTDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+
+# prepare chunk indications
+# -------------------------
+# for a given number of tuples n and a number of splits m
+# creates m files with intervals [0,n/m - 1], ... [n(m-1)/m, n - 1]
+
+n=$1
+m=$2
+funcfile=$3
+funcname=$4
+inputdir=$5
+outputdir=$6
+REMOVETABS=$7 # TODO flag for tab removal
+LOC=$8
+ROWARG=$n
+
+
+
+# determine data generator file
+# -----------------------------
+
+if [ "$funcfile" == "builtin" ];
+then
+	funcfile="functions.py"
+	funcfilelocation=$SCRIPTDIR/$funcfile
+else
+	funcfilelocation=$funcfile
+	funcfile=`basename $funcfile`
+fi
+
+
+
+#echo "function file: " $funcfilelocation
+
+
+# create chunck indicators
+# ------------------------
+
+# for each of the m chunks
+for i in $(seq 1 $m)
+do
+	echo "creating chunk " $i "..."
+	
+	# calculate bounds for current chunk
+	let i=i-1
+	let start=$i*$n/$m
+	let end=($i+1)*$n/$m-1
+	
+	# create file
+	filename=CHUNK_$i.txt
+	echo $start $end $i > $filename
+	
+done
+
+echo "copying chunks to hdfs in folder " $inputdir
+
+
+
+# execute data generator
+# ----------------------
+
+if [ "$LOC" == "local" ];
+then
+	cat CHUNK_*.txt | python $SCRIPTDIR/mapper.py $funcfilelocation $funcname $ROWARG
+else
+
+	# copy chunks to hdfs
+	hdfs dfs -mkdir -p "$inputdir"
+	hdfs dfs -copyFromLocal CHUNK_*.txt "$inputdir"
+	
+	# remove local chunk files
+	rm CHUNK_*.txt
+
+
+	mapcommand="mapper.py $funcfile $funcname $ROWARG"
+	# the output format is set to make sure that the first tab is ignored
+	# this is implemented to avoid extra tabs when no-tab output is generated
+	outputformat="-outputformat mapreduce.extensions.NoTabOutputFormat"
+	if [ "$REMOVETABS" == "0" ];
+	then
+		outputformat=""
+		echo "tab removal disabled"
+	else
+		echo "tab removal active"
+	fi
+
+	echo $outputformat
+
+	#echo $mapcommand
+	
+	echo "hadoop jar $STREAMJAR \
+	  -D mapreduce.job.reduces=0 \
+	  -libjars $SCRIPTDIR/NoTabFix.jar \
+	  -input $inputdir \
+	  -output $outputdir \
+	  $outputformat \
+	  -mapper \"$mapcommand\" \
+	  -file $SCRIPTDIR/mapper.py \
+	  -file $funcfilelocation"
+
+	# note that the -files option needs to be before the normal options
+	hadoop jar $STREAMJAR \
+	  -D mapreduce.job.reduces=0 \
+	  -libjars $SCRIPTDIR/NoTabFix.jar \
+	  -input $inputdir \
+	  -output $outputdir \
+	  $outputformat \
+	  -mapper "$mapcommand" \
+	  -file $SCRIPTDIR/mapper.py \
+	  -file $funcfilelocation
+	
+
+	# -files $SCRIPTDIR/mapper.py,$funcfilelocation \
+	# -D mapred.textoutputformat.separator=','\
+	# -D stream.map.output.field.separator=',' \
+	# -D stream.num.map.output.key.fields=0 \
+
+	# remove data chunks on hdfs
+	hdfs dfs -rm -r -skipTrash "$inputdir"
+fi
+
+
+
+echo "done."
+
