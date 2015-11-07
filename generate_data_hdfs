@@ -8,6 +8,10 @@
 #
 # hdfs_tmpdir will be created and removed after use!
 
+
+genid=$(date +%s%N | cut -b1-13)
+
+
 if [ $# -ne 8 ]
 then
     echo "	Usage: generate_hdfs_data.sh num_rows num_chunks {function.py|builtin} funcname hdfs_tmpdir hdfs_outdir tabremoval{0|1} {hadoop|local}"
@@ -21,7 +25,9 @@ fi
 STREAMJAR=$HADOOP_STREAM_JAR
 
 # store script location
-SCRIPTDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+#SCRIPTDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+SCRIPTDIR=$( dirname $( readlink -f "${BASH_SOURCE[0]}" ) )
+echo "Script dir:" $SCRIPTDIR
 
 
 # prepare chunk indications
@@ -39,7 +45,10 @@ REMOVETABS=$7 # TODO flag for tab removal
 LOC=$8
 ROWARG=$n
 
-
+tmploc=$(mktemp -d)
+parentindir=$inputdir
+inputdir=$inputdir$tmploc
+echo "changed input dir to" $inputdir
 
 # determine data generator file
 # -----------------------------
@@ -73,11 +82,9 @@ do
 	
 	# create file
 	filename=CHUNK_$i.txt
-	echo $start $end $i > $filename
+	echo $start $end $i > $tmploc/$filename
 	
 done
-
-echo "copying chunks to hdfs in folder " $inputdir
 
 
 
@@ -86,15 +93,24 @@ echo "copying chunks to hdfs in folder " $inputdir
 
 if [ "$LOC" == "local" ];
 then
-	cat CHUNK_*.txt | python $SCRIPTDIR/mapper.py $funcfilelocation $funcname $ROWARG
+	cat ${tmploc}/CHUNK_*.txt | python $SCRIPTDIR/mapper.py $funcfilelocation $funcname $ROWARG
+	
+	if [ "$m" == "auto" ];
+	then
+		echo "auto-chunking enabled"
+	fi
+	# generate test data
+	samplefile=$tmploc/sample.txt
+	cat ${tmploc}/CHUNK_*.txt | python $SCRIPTDIR/mapper.py $funcfilelocation $funcname 1000 > $samplefile
+	bytes=$(stat --printf="%s" $samplefile)
+	
 else
+	
+	echo "copying chunks to hdfs in folder " $inputdir
 
 	# copy chunks to hdfs
 	hdfs dfs -mkdir -p "$inputdir"
-	hdfs dfs -copyFromLocal CHUNK_*.txt "$inputdir"
-	
-	# remove local chunk files
-	rm CHUNK_*.txt
+	hdfs dfs -copyFromLocal ${tmploc}/CHUNK_*.txt "$inputdir"
 
 
 	mapcommand="mapper.py $funcfile $funcname $ROWARG"
@@ -111,9 +127,9 @@ else
 
 	echo $outputformat
 
-	#echo $mapcommand
 	
-	echo "hadoop jar $STREAMJAR \
+	# note that the -files option needs to be before the normal options
+	cmd="hadoop jar $STREAMJAR \
 	  -D mapreduce.job.reduces=0 \
 	  -libjars $SCRIPTDIR/NoTabFix.jar \
 	  -input $inputdir \
@@ -122,17 +138,11 @@ else
 	  -mapper \"$mapcommand\" \
 	  -file $SCRIPTDIR/mapper.py \
 	  -file $funcfilelocation"
+	
+	echo "$cmd"
+	eval $cmd
 
-	# note that the -files option needs to be before the normal options
-	hadoop jar $STREAMJAR \
-	  -D mapreduce.job.reduces=0 \
-	  -libjars $SCRIPTDIR/NoTabFix.jar \
-	  -input $inputdir \
-	  -output $outputdir \
-	  $outputformat \
-	  -mapper "$mapcommand" \
-	  -file $SCRIPTDIR/mapper.py \
-	  -file $funcfilelocation
+
 	
 
 	# -files $SCRIPTDIR/mapper.py,$funcfilelocation \
@@ -142,8 +152,13 @@ else
 
 	# remove data chunks on hdfs
 	hdfs dfs -rm -r -skipTrash "$inputdir"
+	hdfs dfs -rmdir "$parentindir/tmp"
+	hdfs dfs -rmdir "$parentindir"
 fi
 
+
+# remove local chunk files
+rm ${tmploc}/CHUNK_*.txt
 
 
 echo "done."
